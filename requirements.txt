@@ -1,4 +1,4 @@
-discord-py==2.5.2
-redis==5.0.4
-ollama==0.2.0
+discord-py
+redis
+ollama
 audioop-lts
