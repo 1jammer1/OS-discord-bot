@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import io
 import os
 import json
@@ -8,6 +9,7 @@ import random
 
 import ollama
 import discord
+from discord.ext import commands
 import redis.asyncio as aioredis
 import openai
 
@@ -71,7 +73,24 @@ class DiscordResponse:
         return escaped
 
 class Bot:
-    def __init__(self, ollama_client, discord_client, redis_client, model, admin_id, chat_channel_id, bot_name, chat_max_length=500, ctx=4096, send_delay_ms=500, msg_max_chars=1000, stream=False, predict=None, backend='ollama'):
+    def __init__(
+        self,
+        ollama_client,
+        discord_client,
+        redis_client,
+        model,
+        admin_id,
+        chat_channel_id,
+        bot_name,
+        chat_max_length=500,
+        ctx=4096,
+        send_delay_ms=500,
+        msg_max_chars=1000,
+        stream=False,
+        predict=None,
+        backend='ollama',
+        test_guild_id: int | None = None,
+    ):
         self.ollama = ollama_client
         self.discord = discord_client
         self.redis = redis_client
@@ -87,19 +106,33 @@ class Bot:
         self.stream = stream
         self.predict = predict
         self.backend = backend
+        self.test_guild_id = test_guild_id
+
+        # register event handlers
         self.discord.event(self.on_ready)
         self.discord.event(self.on_message)
+
+        # register the slash command on the tree with logging for failures
         try:
-            self.discord.tree.add_command(discord.app_commands.Command(self.reset_command, name='reset', description='Reset the chat for this channel'))
-        except Exception:
-            pass
+            cmd = discord.app_commands.Command(self.reset_command, name='reset', description='Reset the chat for this channel')
+            self.discord.tree.add_command(cmd)
+            logging.info("Registered /reset application command")
+        except Exception as e:
+            logging.error("Failed to add /reset command to the command tree: %s", e)
 
     async def on_ready(self):
         activity = discord.Activity(name='Status', state=f'Hi, I\'m {self.bot_name.title()}! I only respond to mentions.', type=discord.ActivityType.custom)
-        await self.discord.change_presence(activity=activity)
         try:
-            app_id = getattr(self.discord, 'application_id', None)
+            await self.discord.change_presence(activity=activity)
+        except Exception as e:
+            logging.error('Failed to change presence: %s', e)
+
+        app_id = getattr(self.discord, 'application_id', None)
+        logging.info('Discord application_id: %s', app_id)
+
+        try:
             if app_id:
+                # include applications.commands so invite URL can grant slash-permissions
                 logging.info(
                     'Ready! Invite URL: %s',
                     discord.utils.oauth_url(
@@ -109,17 +142,26 @@ class Bot:
                             send_messages=True,
                             create_public_threads=True,
                         ),
-                        scopes=['bot'],
+                        scopes=['bot', 'applications.commands'],
                     ),
                 )
             else:
                 logging.info('Ready! application_id not available; invite URL skipped.')
         except Exception as e:
             logging.error('Error generating invite URL: %s', e)
+
+        # Sync application commands: prefer guild sync for fast dev iteration when TEST_GUILD_ID is set
         try:
-            await self.discord.tree.sync()
+            if self.test_guild_id:
+                guild_obj = discord.Object(id=int(self.test_guild_id))
+                await self.discord.tree.sync(guild=guild_obj)
+                logging.info('Synced application commands to guild %s', self.test_guild_id)
+            else:
+                await self.discord.tree.sync()
+                logging.info('Synced global application commands')
         except Exception as e:
             logging.error('Error syncing application commands: %s', e)
+
         self.ready = True
 
     async def reset_command(self, interaction: discord.Interaction):
@@ -160,6 +202,11 @@ class Bot:
     async def on_message(self, message):
         if not self.ready:
             return
+
+        # ignore if no content or system messages
+        if not hasattr(message, "channel"):
+            return
+
         string_channel_id = str(message.channel.id)
         if self.chat_channel_id:
             if string_channel_id != self.chat_channel_id:
@@ -171,14 +218,20 @@ class Bot:
             if self.discord.user.mentioned_in(message):
                 await response.write(message, 'I am sorry, I am unable to respond in private messages.')
             return
+
+        # Save context even when not addressed
         if not self.discord.user.mentioned_in(message) or message.author.bot or '@everyone' in message.content or '@here' in message.content:
             await self.save_message(str(message.channel.id), self.message(message, message.content), 'user')
             logging.info('Message saved for context in %s, but it was not for us', (message.channel.id))
+            # only rarely continue processing non-mentions
             if (random.random() * 1000) > 0.1:
                 return
+
         content = message.content.replace(f'<@{self.discord.user.id}>', self.bot_name.title()).strip()
         if not content:
             return
+
+        # legacy text-reset command (admin-only)
         if content == 'RESET' and str(message.author.id) == self.admin_id:
             await self.flush_channel(str(message.channel.id))
             logging.info('Chat reset by admin in %s', (message.channel.id))
@@ -187,6 +240,7 @@ class Bot:
         elif content == 'RESET' and str(message.author.id) != self.admin_id:
             logging.info('Chat reset denied by user %s in %s', message.author.name, (message.channel.id))
             content = message.author.name + ' tried to reset the chat, but was denied.'
+
         channel = message.channel
         logging.info('Generating response for message %s in channel %s', message.id, channel.id)
         r = DiscordResponse(message)
@@ -341,6 +395,7 @@ def main():
     parser.add_argument('--stream', action='store_true')
     parser.add_argument('--predict', default=None, type=int)
     parser.add_argument('--type', default=os.getenv('TYPE', 'ollama'), type=str)
+    parser.add_argument('--test-guild-id', default=os.getenv('TEST_GUILD_ID', ''), type=str, help='Optional guild id to register commands to for instant availability')
     args = parser.parse_args()
 
     predict_env = os.getenv('PREDICT')
@@ -358,8 +413,11 @@ def main():
 
     redis_client = aioredis.Redis(host=args.redis_host, port=args.redis_port, db=0, decode_responses=True)
     ollama_client = ollama.AsyncClient(host=f'{args.ollama_scheme}://{args.ollama_host}:{args.ollama_port}')
-    client = discord.Client(intents=intents)
+    # Use commands.Bot to ensure app command lifecycle integration
+    client = commands.Bot(command_prefix="!", intents=intents, application_id=None)
     client.bot_send_delay = args.send_delay_ms / 1000.0
+
+    test_guild_id = int(args.test_guild_id) if args.test_guild_id and args.test_guild_id.isdigit() else (int(os.getenv('TEST_GUILD_ID')) if os.getenv('TEST_GUILD_ID') and os.getenv('TEST_GUILD_ID').isdigit() else None)
 
     Bot(
         ollama_client,
@@ -376,6 +434,7 @@ def main():
         stream=args.stream,
         predict=predict,
         backend=backend,
+        test_guild_id=test_guild_id,
     ).run(token)
 
 if __name__ == '__main__':
